@@ -1,0 +1,2 @@
+12441 bash .termux/boot/boot-restore-adb.sh --watch 60
+12421 sshd

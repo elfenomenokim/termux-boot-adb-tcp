@@ -1,0 +1,1075 @@
+#!/usr/bin/env bash
+# termux-adb - set up, check and keep the Termux:Boot ADB port restore on an Android device
+# from a Mac or Linux host. The device-side script ships beside this file.
+#
+# VERSION matches boot-restore-adb.sh; both files leave in the same release.
+# Bash 3.2 (the macOS system shell) is the floor: no arrays, no ${var,,}.
+set -u
+
+VERSION=0.3.1
+
+# Follow symlinks so a link in ~/.local/bin still finds the device script next to the
+# real file. macOS readlink has no -f, so resolve one hop at a time.
+script_path() {
+    local src=$1 dir
+    while [[ -L $src ]]; do
+        dir=$(cd -- "$(dirname -- "$src")" && pwd -P)
+        src=$(readlink -- "$src")
+        case $src in /*) ;; *) src=$dir/$src ;; esac
+    done
+    printf '%s/%s' "$(cd -- "$(dirname -- "$src")" && pwd -P)" "$(basename -- "$src")"
+}
+
+SELF=$(script_path "${BASH_SOURCE[0]}")
+BOOT_SCRIPT=$(dirname -- "$SELF")/boot-restore-adb.sh
+DEFAULT_PORT=5555
+TERMUX=/data/data/com.termux
+TERMUX_HOME=$TERMUX/files/home
+TERMUX_USR=$TERMUX/files/usr
+BOOT_DIR=$TERMUX_HOME/.termux/boot
+REMOTE_BOOT_SCRIPT=$BOOT_DIR/boot-restore-adb.sh
+SSH_DIR=$TERMUX_HOME/.ssh
+AUTHORIZED_KEYS=$SSH_DIR/authorized_keys
+LABEL=com.termux-adb.keeper
+
+usage() {
+    cat <<EOF
+termux-adb $VERSION - install, check and keep the Termux:Boot ADB port restore.
+
+Usage: termux-adb [-s SERIAL | --device HOST:PORT] <command> [options]
+
+Commands
+  install [--ssh-key FILE] [--no-start] [--battery-saver] [--vpn-app PKG] [--fetch-apps]
+        Copy boot-restore-adb.sh to ~/.termux/boot, allow Termux and Termux:Boot
+        through battery optimization, launch Termux:Boot once, optionally add an
+        SSH public key, start the restore now, then run doctor. --vpn-app makes a
+        VPN app (for example com.tailscale.ipn) Android's always-on VPN, so it
+        reconnects by itself after a reboot or a system update. --fetch-apps
+        downloads and installs missing Termux, Termux:Boot (GitHub builds) and
+        KeepADB (F-Droid, signature checked with gpg).
+  doctor
+        Read-only checks of the device, the packages, the battery allow-list,
+        Samsung's auto-disable list, the installed script and the running watch.
+        Exit 1 when any check fails.
+  keeper [--ssh-port 8022] [--log FILE]
+        One recovery pass: re-enable Termux packages and start the boot script
+        when the watch is gone (or the SSH port is closed).
+  keeper --install [--interval 300] | --uninstall
+        Run one pass every N seconds from launchd (macOS) or a systemd user timer.
+
+Global options
+  -s, --device SERIAL   adb serial (HOST:PORT for a network device)
+  --version             print the version and exit
+  -h, --help            print this help and exit
+
+Environment
+  TERMUX_ADB_DEVICE     same as --device
+  ADB                   adb binary to call (default: adb from PATH)
+  TERMUX_ADB_LOG        keeper log path (default: ~/.local/state/termux-adb-keeper.log)
+EOF
+}
+
+die() { printf '%s\n' "termux-adb: $*" >&2; exit 1; }
+
+usage_error() {
+    printf '%s\n' "termux-adb: $*" >&2
+    printf '%s\n' "Run 'termux-adb --help'." >&2
+    exit 2
+}
+
+# --- shared helpers -------------------------------------------------------------------
+
+ADB_BIN=${ADB:-}
+require_adb() {
+    if [[ -z $ADB_BIN ]]; then
+        ADB_BIN=$(command -v adb 2>/dev/null) || true
+    fi
+    [[ -n $ADB_BIN && -x $ADB_BIN ]] \
+        || die "adb not found. Install Android platform-tools and put adb on PATH, or set ADB=/path/to/adb."
+}
+
+# The serial named by the flag or the environment; empty means "the one device attached".
+EXPLICIT_SERIAL=${TERMUX_ADB_DEVICE:-}
+SERIAL=
+resolve_serial() {
+    if [[ -n $EXPLICIT_SERIAL ]]; then
+        SERIAL=$EXPLICIT_SERIAL
+        return 0
+    fi
+    local list count
+    list=$("$ADB_BIN" devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }')
+    count=$(printf '%s\n' "$list" | grep -c . || true)
+    case $count in
+        0)
+            printf '%s\n' "termux-adb: no adb device in the 'device' state." >&2
+            "$ADB_BIN" devices -l >&2 || true
+            printf '%s\n' "Connect the device, run 'adb pair HOST:PORT' once, then 'adb connect HOST:PORT'." >&2
+            exit 1 ;;
+        1) SERIAL=$list ;;
+        *)
+            printf '%s\n' "termux-adb: several devices attached; choose one with --device:" >&2
+            printf '%s\n' "$list" >&2
+            exit 1 ;;
+    esac
+}
+
+# A HOST:PORT target goes through 'adb connect' on every run; an already connected
+# device answers "already connected" and stays usable.
+connect_target() {
+    case $SERIAL in
+        *:*) "$ADB_BIN" connect "$SERIAL" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+sh_() {
+    "$ADB_BIN" -s "$SERIAL" shell "$@" 2>/dev/null | tr -d '\r'
+}
+
+# adb's own exit status, for commands whose success decides the next step.
+shell_ok() {
+    "$ADB_BIN" -s "$SERIAL" shell "$@" >/dev/null 2>&1
+}
+
+device_reachable() {
+    [[ $("$ADB_BIN" -s "$SERIAL" get-state 2>/dev/null | tr -d '\r') == device ]]
+}
+
+prop() { sh_ getprop "$1" | head -1; }
+
+pkg_installed() {
+    sh_ pm list packages --user current | grep -qx "package:$1"
+}
+
+pkg_version() {
+    sh_ dumpsys package "$1" | sed -n 's/.*versionName=\([^ ]*\).*/\1/p' | head -1
+}
+
+pkg_not_launched() {
+    sh_ dumpsys package "$1" | tr ' ' '\n' | sed -n 's/^notLaunched=//p' | head -1
+}
+
+pkg_last_disabled_caller() {
+    sh_ dumpsys package "$1" | sed -n 's/.*lastDisabledCaller: *//p' | head -1
+}
+
+disabled_packages() {
+    sh_ pm list packages -d --user current | sed -n 's/^package://p'
+}
+
+KEEPADB=de.hohnepeople.keepadb
+
+keepadb_granted() {
+    sh_ dumpsys package "$KEEPADB" | grep -q 'android.permission.WRITE_SECURE_SETTINGS: granted=true'
+}
+
+deviceidle_allowlisted() {
+    sh_ dumpsys deviceidle whitelist | grep -qE "(^|,)$1(,|$)"
+}
+
+# Android shell cannot read another app's files, so everything under Termux's data
+# directory goes through run-as (Termux is debuggable).
+run_as() {
+    "$ADB_BIN" -s "$SERIAL" shell run-as com.termux "$@" 2>/dev/null | tr -d '\r'
+}
+
+# Install the Termux packages the boot script needs (sshd, adb, nmap) through run-as,
+# with the environment Termux itself would set. Slow links can take a few minutes.
+install_termux_packages() {
+    local missing='' bin pkg out
+    for bin in sshd:openssh adb:android-tools nmap:nmap; do
+        run_as test -x "$TERMUX_USR/bin/${bin%%:*}" >/dev/null 2>&1 || missing="$missing ${bin#*:}"
+    done
+    missing=${missing# }
+    if [[ -z $missing ]]; then
+        ok "Termux packages present (openssh, android-tools, nmap)"
+        return 0
+    fi
+    printf '%s\n' "installing Termux packages: $missing (this can take a few minutes)"
+    # adb shell joins its arguments into one remote command line, so quote the script.
+    out=$("$ADB_BIN" -s "$SERIAL" shell "run-as com.termux $TERMUX_USR/bin/env HOME=$TERMUX_HOME PREFIX=$TERMUX_USR TMPDIR=$TERMUX_USR/tmp PATH=$TERMUX_USR/bin LANG=en_US.UTF-8 $TERMUX_USR/bin/bash -c 'yes | pkg install -y -o Dpkg::Options::=--force-confold $missing >/dev/null 2>&1; echo rc=\$?'" 2>/dev/null | tr -d '\r')
+    for pkg in $missing; do
+        case $pkg in openssh) bin=sshd ;; android-tools) bin=adb ;; *) bin=$pkg ;; esac
+        if run_as test -x "$TERMUX_USR/bin/$bin" >/dev/null 2>&1; then
+            ok "installed Termux package $pkg"
+        else
+            warn "could not install Termux package $pkg (${out:-no output})"
+            fix "run in Termux: pkg install -y $pkg"
+        fi
+    done
+}
+
+# Termux's adb client needs a writable TMPDIR and HOME (its key lives in ~/.android);
+# run-as sets neither, and then the adb server never starts.
+termux_adb() {
+    run_as "$TERMUX_USR/bin/env" TMPDIR="$TERMUX_USR/tmp" HOME="$TERMUX_HOME" "$TERMUX_USR/bin/adb" "$@"
+}
+
+run_as_allowed() {
+    "$ADB_BIN" -s "$SERIAL" shell run-as com.termux true >/dev/null 2>&1
+}
+
+watch_pid() {
+    sh_ ps -A -o PID,ARGS | awk '/boot-restore-adb\.sh --watch/ { print $1; exit }'
+}
+
+sshd_pid() {
+    sh_ ps -A -o PID,ARGS | awk '$2 == "sshd" { print $1; exit }'
+}
+
+file_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{ print $NF }'
+    else
+        return 1
+    fi
+}
+
+# 0 open, 1 closed, 2 cannot tell (nc missing)
+port_open() {
+    local host=$1 port=$2
+    command -v nc >/dev/null 2>&1 || return 2
+    nc -z -w 5 "$host" "$port" >/dev/null 2>&1
+}
+
+target_host() { case $SERIAL in *:*) printf '%s' "${SERIAL%:*}" ;; esac; }
+target_port() { case $SERIAL in *:*) printf '%s' "${SERIAL##*:}" ;; esac; }
+
+start_boot_script() {
+    "$ADB_BIN" -s "$SERIAL" shell \
+        "run-as com.termux sh -c 'cd $TERMUX_HOME && PATH=$TERMUX_USR/bin:\$PATH PREFIX=$TERMUX_USR HOME=$TERMUX_HOME setsid nohup $TERMUX_USR/bin/bash .termux/boot/boot-restore-adb.sh >/dev/null 2>&1 </dev/null &'" \
+        >/dev/null 2>&1
+}
+
+remote_read() {
+    local command=$1 host
+    case $remote_method:$command in
+        runas:sha) run_as sha256sum "$REMOTE_BOOT_SCRIPT" ;;
+        runas:log) run_as tail -n 3 "$TERMUX_HOME/.termux/boot.log" ;;
+        ssh:*)
+            host=$(target_host)
+            case $command in
+                sha) ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$DOCTOR_SSH_PORT" "$DOCTOR_SSH_USER@$host" 'sha256sum ~/.termux/boot/boot-restore-adb.sh' 2>/dev/null ;;
+                log) ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$DOCTOR_SSH_PORT" "$DOCTOR_SSH_USER@$host" 'tail -n 3 ~/.termux/boot.log' 2>/dev/null ;;
+                auth) ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$DOCTOR_SSH_PORT" "$DOCTOR_SSH_USER@$host" 'TMPDIR=${TMPDIR:-$PREFIX/tmp} adb devices' 2>/dev/null ;;
+                watch) ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$DOCTOR_SSH_PORT" "$DOCTOR_SSH_USER@$host" "ps -A -o PID,ARGS | awk '/[b]oot-restore-adb\.sh --watch/ {print \$1; exit}'" 2>/dev/null ;;
+            esac ;;
+    esac
+    return 0
+}
+
+# --- doctor ---------------------------------------------------------------------------
+
+OK_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+ok() { printf '✓ %s\n' "$*"; OK_COUNT=$((OK_COUNT + 1)); }
+warn() { printf '! %s\n' "$*"; WARN_COUNT=$((WARN_COUNT + 1)); }
+bad() { printf '✗ %s\n' "$*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+fix() { printf '    fix: %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+
+summary() {
+    printf '\n%d ok, %d warning, %d problem\n' "$OK_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+    [[ $FAIL_COUNT -eq 0 ]]
+}
+
+cmd_doctor() {
+    [[ -f $BOOT_SCRIPT ]] || die "boot-restore-adb.sh is missing beside $SELF."
+    local manufacturer model android version not_launched disabled_names name
+    local watch ssh wifi tcp_prop local_sha remote_sha bootlog mars targets
+    local host port
+
+    printf 'termux-adb %s doctor  ·  %s\n\n' "$VERSION" "$SERIAL"
+
+    if ! device_reachable; then
+        bad "adb cannot reach $SERIAL"
+        fix "keep the device awake; for a network device enable Wireless debugging and accept the prompt, then run it again"
+        summary
+        return 1
+    fi
+    manufacturer=$(prop ro.product.manufacturer)
+    model=$(prop ro.product.model)
+    android=$(prop ro.build.version.release)
+    ok "adb: $model · Android $android · $SERIAL"
+
+    if pkg_installed com.termux; then
+        version=$(pkg_version com.termux)
+        ok "com.termux ${version:-installed}"
+    else
+        bad "com.termux is not installed"
+        fix "install Termux from https://f-droid.org/packages/com.termux/"
+    fi
+
+    if pkg_installed com.termux.boot; then
+        version=$(pkg_version com.termux.boot)
+        not_launched=$(pkg_not_launched com.termux.boot)
+        if [[ $not_launched == true ]]; then
+            bad "com.termux.boot ${version:-installed} was never launched"
+            fix "open the Termux:Boot app once; nothing runs at boot until it has started"
+        elif [[ -z $not_launched ]]; then
+            warn "com.termux.boot ${version:-installed}; the launch state is unreadable"
+        else
+            ok "com.termux.boot ${version:-installed} launched once"
+        fi
+    else
+        bad "com.termux.boot is not installed"
+        fix "install Termux:Boot from https://f-droid.org/packages/com.termux.boot/ and open it once"
+    fi
+
+    disabled_names=$(disabled_packages | grep -x 'com\.termux\(\.boot\)\?' || true)
+    if [[ -z $disabled_names ]]; then
+        ok "packages enabled"
+    else
+        for name in $disabled_names; do
+            bad "$name is disabled"
+            info "lastDisabledCaller: $(pkg_last_disabled_caller "$name")"
+            fix "termux-adb install (or 'adb shell pm enable $name')"
+        done
+    fi
+
+    for name in com.termux com.termux.boot; do
+        if pkg_installed "$name"; then
+            if deviceidle_allowlisted "$name"; then
+                ok "battery allow-list: $name"
+            else
+                bad "$name is not on the battery allow-list"
+                fix "termux-adb install (or 'adb shell cmd deviceidle whitelist +$name')"
+            fi
+        fi
+    done
+
+    local auth_timeout auth_devices remote_method=none vendor
+    auth_timeout=$(sh_ settings get global adb_allowed_connection_time)
+    case $auth_timeout in
+        0) ok "adb authorization timeout disabled" ;;
+        ''|null) warn "adb authorization timeout unreadable" ;;
+        *) bad "adb authorization timeout is $auth_timeout"; fix "termux-adb install (or 'adb shell settings put global adb_allowed_connection_time 0')" ;;
+    esac
+    local vpn_app
+    vpn_app=$(sh_ settings get secure always_on_vpn_app | tr -d '\r')
+    if [[ -n $vpn_app && $vpn_app != null ]]; then
+        ok "always-on VPN: $vpn_app"
+    elif pkg_installed com.tailscale.ipn; then
+        warn "Tailscale is installed but not the always-on VPN: it stays off after a reboot or system update"
+        fix "termux-adb install --vpn-app com.tailscale.ipn"
+    fi
+    if ! pkg_installed "$KEEPADB"; then
+        warn "KeepADB is not installed: if a system update turns Wireless debugging off, nothing on the device can turn it back on"
+        fix "install KeepADB from F-Droid (https://f-droid.org/packages/$KEEPADB/), then run termux-adb install and turn on Keep-Alive in the app"
+    elif keepadb_granted; then
+        ok "KeepADB can switch Wireless debugging back on"
+        if sh_ dumpsys activity services "$KEEPADB" | grep -q 'KeepADBService'; then
+            ok "KeepADB Keep-Alive service running"
+        else
+            warn "KeepADB Keep-Alive is off"
+            fix "open KeepADB and finish its setup assistant: Keep-Alive on, trust your Wi-Fi (see AGENTS.md)"
+        fi
+    else
+        bad "KeepADB is installed but lacks WRITE_SECURE_SETTINGS"
+        fix "termux-adb install (or 'adb shell pm grant $KEEPADB android.permission.WRITE_SECURE_SETTINGS')"
+    fi
+    case $(printf '%s' "$manufacturer" | tr '[:upper:]' '[:lower:]') in
+        xiaomi|redmi|poco) vendor=xiaomi ;;
+        huawei|honor) vendor=huawei ;;
+        oneplus) vendor=oneplus ;;
+        oppo|realme) vendor=oppo ;;
+        vivo) vendor=vivo ;;
+        motorola) vendor=motorola ;;
+        google) vendor=google ;;
+        *) vendor= ;;
+    esac
+    [[ -z $vendor ]] || warn "$manufacturer: check app battery/background restrictions: https://dontkillmyapp.com/$vendor"
+    if run_as_allowed; then remote_method=runas
+    elif [[ -n $DOCTOR_SSH_PORT && -n $DOCTOR_SSH_USER && -n $(target_host) ]]; then remote_method=ssh
+    fi
+
+    # Samsung MARs disables apps it considers idle, on a list of its own. A disabled
+    # Termux:Boot misses BOOT_COMPLETED, so this check is separate from the allow-list.
+    if [[ $(printf '%s' "$manufacturer" | tr '[:upper:]' '[:lower:]') == samsung ]]; then
+        mars=$(sh_ dumpsys activity mars)
+        if [[ -z $mars ]]; then
+            warn "samsung: 'dumpsys activity mars' returned nothing; the auto-disable list was not checked"
+        else
+            targets=$(printf '%s\n' "$mars" \
+                | sed -n '/^mMARsTargetPackages/,/^mMARsRestrictedPackages/p' \
+                | sed -n 's/.*-Pkg \(com\.termux\(\.boot\)\{0,1\}\)$/\1/p' | sort -u)
+            if [[ -n $targets ]]; then
+                warn "Samsung may auto-disable: $(printf '%s' "$targets" | tr '\n' ' ')"
+                fix "set Battery to Unrestricted for that app (Settings > Apps > <app> > Battery); 'termux-adb install' does the same"
+            else
+                ok "samsung: com.termux is not in the auto-disable target list"
+            fi
+        fi
+    fi
+
+    if [[ $remote_method == none ]]; then
+        bad "run-as is not permitted; the installed boot script was not read"
+        fix "use the Termux one-liner that 'termux-adb install' prints"
+    else
+        remote_sha=$(remote_read sha | awk '{ print $1 }')
+        local_sha=$(file_sha256 "$BOOT_SCRIPT" || true)
+        if [[ -z $remote_sha ]]; then
+            bad "$REMOTE_BOOT_SCRIPT is missing"
+            fix "termux-adb install"
+        elif [[ -n $local_sha && $remote_sha == "$local_sha" ]]; then
+            ok "boot script installed, sha256 matches $VERSION"
+        else
+            warn "boot script installed, bytes differ from this $VERSION copy"
+            fix "termux-adb install"
+        fi
+    fi
+
+    watch=$(watch_pid)
+    if [[ $remote_method == ssh ]]; then watch=$(remote_read watch); fi
+    if [[ -n $watch ]]; then
+        ok "watch running (pid $watch)"
+    else
+        bad "no boot-restore-adb.sh --watch process"
+        fix "termux-adb install (or run the boot script in Termux)"
+    fi
+
+    ssh=$(sshd_pid)
+    if [[ -n $ssh ]]; then
+        ok "sshd running (pid $ssh)"
+    else
+        warn "sshd not running"
+        info "optional: 'pkg install openssh' and start sshd in Termux"
+    fi
+
+    wifi=$(sh_ settings get global adb_wifi_enabled)
+    case $wifi in
+        1) ok "wireless debugging on (adb_wifi_enabled=1)" ;;
+        0)
+            warn "wireless debugging off (adb_wifi_enabled=0)"
+            info "the watch switches it back on while Wi-Fi is up; a port opened with 'adb tcpip' stays open without it" ;;
+        *)
+            warn "wireless debugging state unreadable (adb_wifi_enabled=${wifi:-empty})" ;;
+    esac
+
+    tcp_prop=$(prop service.adb.tcp.port)
+    host=$(target_host)
+    port=$(target_port)
+    if [[ -n $host && -n $port ]]; then
+        port_open "$host" "$port"
+        case $? in
+            0) ok "port $port open on $host (service.adb.tcp.port=${tcp_prop:-empty})" ;;
+            1) bad "port $port closed on $host (service.adb.tcp.port=${tcp_prop:-empty})"
+               fix "run the boot script in Termux, and check that the device is on the same network" ;;
+            *) ok "service.adb.tcp.port=${tcp_prop:-empty} (nc is not installed, so the port was not tested)" ;;
+        esac
+    elif [[ $tcp_prop == "$DEFAULT_PORT" ]]; then
+        ok "adb listens on TCP port $DEFAULT_PORT (service.adb.tcp.port)"
+    else
+        bad "adb is not listening on TCP (service.adb.tcp.port=${tcp_prop:-empty})"
+        fix "run the boot script once in Termux; it switches the daemon to TCP"
+    fi
+
+    bootlog=$(remote_read log)
+    if [[ $remote_method == runas ]]; then
+        auth_devices=$(termux_adb devices)
+        if printf '%s\n' "$auth_devices" | grep -qE '^(127\.0\.0\.1:[0-9]+|emulator-[0-9]+)[[:space:]]+device([[:space:]]|$)'; then
+            ok "Termux adb authorized"
+        else
+            bad "Termux adb is not authorized"; fix "termux-adb install; tap Always allow on the device"
+        fi
+    elif [[ $remote_method == ssh ]]; then
+        auth_devices=$(remote_read auth)
+        if printf '%s\n' "$auth_devices" | grep -qE '^(127\.0\.0\.1:[0-9]+|emulator-[0-9]+)[[:space:]]+device([[:space:]]|$)'; then
+            ok "Termux adb authorized"
+        else
+            bad "Termux adb is not authorized"; fix "run adb connect 127.0.0.1:5555 in Termux; tap Always allow on the device"
+        fi
+    else
+        warn "Termux adb authorization cannot be checked without run-as or SSH"
+    fi
+    if [[ -z $bootlog ]]; then
+        warn "no readable lines in .termux/boot.log under the Termux home"
+    else
+        ok "boot.log, last 3 lines"
+        printf '%s\n' "$bootlog" | sed 's/^/    /'
+    fi
+
+    summary
+}
+
+# --- app download (install --fetch-apps) ---------------------------------------------
+
+FDROID_KEY=37D2C98789D8311948394E3E41E7044E1DBA2E89
+
+# Download URL to FILE; check it against SHA256 (hex) when given.
+fetch_file() {
+    local url=$1 file=$2 sha=${3:-} got
+    curl -fsSL --retry 2 -o "$file" "$url" || return 1
+    [[ -z $sha ]] && return 0
+    got=$( (sha256sum "$file" 2>/dev/null || shasum -a 256 "$file") | awk '{print $1}')
+    [[ $got == "$sha" ]]
+}
+
+# GitHub release asset NAME_PATTERN from REPO, checked against the release's sha256 list.
+fetch_github_apk() {
+    local repo=$1 pattern=$2 dir=$3 json url name sums sha
+    json=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest") || return 1
+    url=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\(http[^"]*\)"/\1/' | grep -E "$pattern" | head -1)
+    sums=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*sha256[^"]*"' | sed 's/.*"\(http[^"]*\)"/\1/' | head -1)
+    [[ -n $url && -n $sums ]] || return 1
+    name=${url##*/}
+    name=${name//%2B/+}
+    sha=$(curl -fsSL "$sums" | grep -F "$name" | awk '{print $1}' | head -1)
+    [[ -n $sha ]] || return 1
+    fetch_file "$url" "$dir/$name" "$sha" && printf '%s\n' "$dir/$name"
+}
+
+# F-Droid's suggested APK for PACKAGE, checked with F-Droid's signing key (needs gpg).
+fetch_fdroid_apk() {
+    local pkg=$1 dir=$2 code apk gnupg
+    command -v gpg >/dev/null 2>&1 || return 2
+    code=$(curl -fsSL "https://f-droid.org/api/v1/packages/$pkg" | grep -o '"suggestedVersionCode": *[0-9]*' | grep -o '[0-9]*$')
+    [[ -n $code ]] || return 1
+    apk="$dir/${pkg}_$code.apk"
+    fetch_file "https://f-droid.org/repo/${pkg}_$code.apk" "$apk" || return 1
+    fetch_file "https://f-droid.org/repo/${pkg}_$code.apk.asc" "$apk.asc" || return 1
+    gnupg=$(mktemp -d)
+    curl -fsSL "https://keys.openpgp.org/vks/v1/by-fingerprint/$FDROID_KEY" | GNUPGHOME=$gnupg gpg --batch --quiet --import 2>/dev/null
+    if GNUPGHOME=$gnupg gpg --batch --status-fd 1 --verify "$apk.asc" "$apk" 2>/dev/null | grep -q '^\[GNUPG:\] VALIDSIG'; then
+        rm -rf "$gnupg"; printf '%s\n' "$apk"; return 0
+    fi
+    rm -rf "$gnupg"; return 1
+}
+
+# Termux unpacks its Linux userland on first launch; nothing else works before that.
+first_launch_termux() {
+    local i=0
+    shell_ok am start -n com.termux/.app.TermuxActivity || true
+    while [[ $i -lt 60 ]]; do
+        if run_as test -x "$TERMUX_USR/bin/bash" >/dev/null 2>&1; then
+            ok "Termux finished its first start"
+            shell_ok input keyevent HOME || true
+            return 0
+        fi
+        sleep 3; i=$((i + 1))
+    done
+    warn "Termux did not finish its first start within 3 minutes"
+    fix "open Termux once by hand and wait for the prompt"
+}
+
+install_apk() {
+    local label=$1 apk=$2
+    if [[ -n $apk ]] && "$ADB_BIN" -s "$SERIAL" install -r "$apk" 2>&1 | grep -q Success; then
+        ok "installed $label ($(basename "$apk"))"
+    else
+        warn "could not install $label"
+        return 1
+    fi
+}
+
+# Termux and Termux:Boot must come from the same source (they share a signing key and user
+# ID). With neither installed, use the GitHub builds: they are debuggable, so this CLI can do
+# every later step through run-as. KeepADB comes from F-Droid.
+fetch_missing_apps() {
+    local dir abi apk termux=0 boot=0 rc
+    command -v curl >/dev/null 2>&1 || { warn "--fetch-apps needs curl"; return 0; }
+    dir=$(mktemp -d)
+    pkg_installed com.termux && termux=1
+    pkg_installed com.termux.boot && boot=1
+    abi=$(prop ro.product.cpu.abi)
+    case $abi in arm64-v8a|armeabi-v7a|x86|x86_64) ;; *) abi=universal ;; esac
+    if [[ $termux -eq 0 && $boot -eq 0 ]]; then
+        apk=$(fetch_github_apk termux/termux-app "github-debug_${abi}\\.apk$" "$dir") && install_apk Termux "$apk" && termux=1
+        [[ $termux -eq 0 ]] || first_launch_termux
+        apk=$(fetch_github_apk termux/termux-boot 'github\.debug\.apk$' "$dir") && install_apk Termux:Boot "$apk" && boot=1
+    elif [[ $termux -eq 1 && $boot -eq 0 ]]; then
+        if run_as_allowed; then
+            apk=$(fetch_github_apk termux/termux-boot 'github\.debug\.apk$' "$dir") && install_apk Termux:Boot "$apk"
+        else
+            apk=$(fetch_fdroid_apk com.termux.boot "$dir"); rc=$?
+            [[ $rc -eq 2 ]] && warn "F-Droid downloads are checked with gpg; install gnupg"
+            [[ $rc -eq 0 ]] && install_apk Termux:Boot "$apk"
+        fi
+    elif [[ $termux -eq 0 ]]; then
+        warn "Termux:Boot is installed without Termux; install Termux from the same source as Termux:Boot"
+    fi
+    if [[ $termux -eq 1 ]] && ! pkg_installed com.termux.boot; then
+        warn "Termux:Boot is still missing"
+    fi
+    if ! pkg_installed "$KEEPADB"; then
+        apk=$(fetch_fdroid_apk "$KEEPADB" "$dir"); rc=$?
+        case $rc in
+            0) install_apk KeepADB "$apk" ;;
+            2) warn "KeepADB not installed: F-Droid downloads are checked with gpg; install gnupg" ;;
+            *) warn "could not download or verify KeepADB from F-Droid" ;;
+        esac
+    fi
+    rm -rf "$dir"
+}
+
+# --- install --------------------------------------------------------------------------
+
+INSTALL_SSH_KEY=
+INSTALL_START=1
+INSTALL_BATTERY_SAVER=0
+INSTALL_KEEP_AUTH_TIMEOUT=0
+INSTALL_VPN_APP=
+INSTALL_FETCH_APPS=0
+DOCTOR_SSH_PORT=${TERMUX_ADB_SSH_PORT:-}
+DOCTOR_SSH_USER=${TERMUX_ADB_SSH_USER:-}
+
+# Push a local file, then let run-as place it where Termux can read it.
+remote_copy() {
+    local local_file=$1 remote_path=$2 mode=$3
+    local tmp
+    tmp=/data/local/tmp/termux-adb.$$.$(basename -- "$local_file")
+    "$ADB_BIN" -s "$SERIAL" push "$local_file" "$tmp" >/dev/null 2>&1 || return 1
+    "$ADB_BIN" -s "$SERIAL" shell \
+        "run-as com.termux sh -c 'mkdir -p $(dirname -- "$remote_path") && cp $tmp $remote_path.new && chmod $mode $remote_path.new && mv -f $remote_path.new $remote_path'" \
+        >/dev/null 2>&1 || { "$ADB_BIN" -s "$SERIAL" shell rm -f "$tmp" >/dev/null 2>&1; return 1; }
+    "$ADB_BIN" -s "$SERIAL" shell rm -f "$tmp" >/dev/null 2>&1 || true
+}
+
+install_ssh_key() {
+    local file=$1 key key_id current combined
+    [[ -r $file ]] || die "cannot read $file."
+    key=$(tr -d '\r' < "$file" | sed -n '1p')
+    case $key in
+        ssh-*|ecdsa-*|sk-*) ;;
+        *) die "$file does not look like an SSH public key." ;;
+    esac
+    if ! run_as_allowed; then
+        warn "run-as is not permitted, so the key was not installed"
+        printf '%s\n' "Append this line to ~/.ssh/authorized_keys in Termux:" "  $key"
+        return 0
+    fi
+    key_id=$(printf '%s' "$key" | awk '{ print $1, $2 }')
+    current=$(run_as cat "$AUTHORIZED_KEYS")
+    if printf '%s\n' "$current" | awk '{ print $1, $2 }' | grep -qxF "$key_id"; then
+        ok "authorized_keys already has this key"
+        return 0
+    fi
+    combined=$(mktemp "${TMPDIR:-/tmp}/termux-adb.authorized_keys.XXXXXX") || die "mktemp failed"
+    chmod 600 "$combined"
+    {
+        if [[ -n $current ]]; then printf '%s\n' "$current"; fi
+        printf '%s\n' "$key"
+    } > "$combined"
+    if remote_copy "$combined" "$AUTHORIZED_KEYS" 600; then
+        ok "authorized_keys: key added (mode 600)"
+    else
+        warn "could not write $AUTHORIZED_KEYS"
+        printf '%s\n' "Append this line in Termux:" "  $key"
+    fi
+    rm -f "$combined"
+}
+
+cmd_install() {
+    [[ -f $BOOT_SCRIPT ]] || die "boot-restore-adb.sh is missing beside $SELF."
+    local missing=0 name
+
+    printf 'termux-adb %s install  ·  %s\n\n' "$VERSION" "$SERIAL"
+
+    if ! device_reachable; then
+        die "adb cannot reach $SERIAL. Connect the device and accept the debugging prompt first."
+    fi
+
+    [[ $INSTALL_FETCH_APPS -eq 0 ]] || fetch_missing_apps
+    for name in com.termux com.termux.boot; do
+        if ! pkg_installed "$name"; then
+            printf '%s\n' "termux-adb: $name is not installed." >&2
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        printf '%s\n' \
+            "  Run: termux-adb install --fetch-apps   (downloads and installs them)" \
+            "  or install Termux and Termux:Boot from the same source (GitHub releases or F-Droid)." >&2
+        exit 1
+    fi
+    ok "com.termux $(pkg_version com.termux) and com.termux.boot $(pkg_version com.termux.boot) present"
+
+    for name in $(disabled_packages | grep -x 'com\.termux\(\.boot\)\?' || true); do
+        if shell_ok pm enable "$name"; then
+            ok "enabled $name (was disabled)"
+        else
+            bad "could not enable $name"
+            fix "open Settings > Apps > $name and enable it"
+        fi
+    done
+
+    for name in com.termux com.termux.boot; do
+        if shell_ok cmd deviceidle whitelist "+$name"; then
+            ok "battery allow-list: $name"
+        else
+            warn "could not add $name to the battery allow-list"
+            fix "set Battery to Unrestricted in Settings > Apps > $name"
+        fi
+    done
+
+    if shell_ok am start -n com.termux.boot/.BootActivity; then
+        ok "launched Termux:Boot once (BootActivity)"
+        shell_ok input keyevent HOME || true
+    else
+        warn "could not launch Termux:Boot"
+        fix "open the Termux:Boot app once by hand"
+    fi
+
+    if [[ $INSTALL_KEEP_AUTH_TIMEOUT -eq 0 ]]; then
+        if shell_ok settings put global adb_allowed_connection_time 0; then
+            ok "adb authorization timeout set to 0"
+        else
+            warn "could not disable adb authorization timeout"
+        fi
+    fi
+    if pkg_installed "$KEEPADB"; then
+        if shell_ok pm grant "$KEEPADB" android.permission.WRITE_SECURE_SETTINGS; then
+            shell_ok cmd deviceidle whitelist "+$KEEPADB" || true
+            # Notifications show Keep-Alive's state; location lets it see which Wi-Fi it is on.
+            for perm in POST_NOTIFICATIONS ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION ACCESS_BACKGROUND_LOCATION; do
+                shell_ok pm grant "$KEEPADB" "android.permission.$perm" || true
+            done
+            ok "KeepADB may switch Wireless debugging back on; in its setup assistant turn Keep-Alive on and trust your Wi-Fi"
+        else
+            warn "could not grant WRITE_SECURE_SETTINGS to KeepADB"
+        fi
+    fi
+    if [[ -n $INSTALL_VPN_APP ]]; then
+        if shell_ok settings put secure always_on_vpn_app "$INSTALL_VPN_APP"; then
+            ok "always-on VPN set to $INSTALL_VPN_APP"
+            shell_ok cmd deviceidle whitelist "+$INSTALL_VPN_APP" && ok "$INSTALL_VPN_APP added to the battery allow-list"
+        else
+            warn "could not set the always-on VPN"
+            fix "Settings > Connections > More connection settings > VPN > $INSTALL_VPN_APP > Always-on VPN"
+        fi
+    fi
+    local port key quoted_key i
+    port=$(target_port); port=${port:-5555}
+    if ! run_as_allowed; then
+        printf '%s\n' "Run this in Termux:"
+        printf '  curl -fsSL https://raw.githubusercontent.com/elfenomenokim/termux-boot-adb-tcp/main/setup.sh | bash -s --'
+        [[ $INSTALL_BATTERY_SAVER -eq 0 ]] || printf ' --battery-saver'
+        [[ -z $INSTALL_VPN_APP ]] || printf ' --vpn-app %s' "$INSTALL_VPN_APP"
+        if [[ -n $INSTALL_SSH_KEY ]]; then
+            [[ -r $INSTALL_SSH_KEY ]] || die "cannot read $INSTALL_SSH_KEY."
+            key=$(tr -d '\r' < "$INSTALL_SSH_KEY" | sed -n '1p')
+            quoted_key=$(printf '%s' "$key" | sed "s/'/'\\\\''/g")
+            printf " --ssh-key '%s'" "$quoted_key"
+        fi
+        printf '\nRun in Termux: adb connect 127.0.0.1:%s\n' "$port"
+        printf '%s\n' "tap Always allow on the device; then run doctor --ssh-port 8022 --ssh-user USER"
+        return 0
+    fi
+    remote_copy "$BOOT_SCRIPT" "$REMOTE_BOOT_SCRIPT" 700 || die "could not copy boot script"
+    ok "copied boot-restore-adb.sh to ~/.termux/boot (mode 700)"
+    local envfile
+    envfile=$(mktemp)
+    [[ $INSTALL_BATTERY_SAVER -eq 0 ]] || printf '%s\n' 'ADB_RESTORE_WAKE_LOCK=0' 'ADB_RESTORE_WATCH_INTERVAL=300' >> "$envfile"
+    [[ -z $INSTALL_VPN_APP ]] || printf 'ADB_RESTORE_VPN_APP=%s\n' "$INSTALL_VPN_APP" >> "$envfile"
+    if [[ -s $envfile ]]; then
+        remote_copy "$envfile" "$TERMUX_HOME/.termux/boot-restore-adb.env" 600 && ok "wrote ~/.termux/boot-restore-adb.env"
+        [[ $INSTALL_BATTERY_SAVER -eq 0 ]] || ok "battery saver: no wake lock, watch every 300 s"
+    else
+        "$ADB_BIN" -s "$SERIAL" shell "run-as com.termux rm -f $TERMUX_HOME/.termux/boot-restore-adb.env" >/dev/null 2>&1 || true
+    fi
+    rm -f "$envfile"
+    [[ -z $INSTALL_SSH_KEY ]] || install_ssh_key "$INSTALL_SSH_KEY"
+    install_termux_packages
+    termux_adb connect "127.0.0.1:$port" >/dev/null || true
+    i=0
+    while [[ $i -lt 30 ]]; do
+        [[ $i -ne 2 ]] || printf '%s\n' "tap Always allow on the device"
+        if termux_adb devices | grep -qE '^(127\.0\.0\.1:[0-9]+|emulator-[0-9]+)[[:space:]]+device([[:space:]]|$)'; then
+            ok "Termux adb authorized"; break
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    [[ $i -lt 30 ]] || warn "Termux adb authorization not confirmed within 30 seconds"
+    if [[ $INSTALL_START -eq 1 ]]; then
+        "$ADB_BIN" -s "$SERIAL" shell "run-as com.termux sh -c 'pkill -f \"boot-restore-adb.sh --watch\"; rm -f $TERMUX_HOME/.termux/boot-restore-adb.watch.pid'" >/dev/null 2>&1 || true
+        start_boot_script
+    fi
+
+    printf '\n'
+    cmd_doctor
+}
+
+# --- keeper ---------------------------------------------------------------------------
+
+KEEPER_SSH_PORT=
+KEEPER_LOG=${TERMUX_ADB_LOG:-$HOME/.local/state/termux-adb-keeper.log}
+KEEPER_NOTIFY_CMD=
+KEEPER_NOTIFY_AFTER=3
+
+keeper_log() {
+    local line
+    line="[$(date '+%F %T')] $*"
+    printf '%s\n' "$line"
+    mkdir -p "$(dirname -- "$KEEPER_LOG")" 2>/dev/null
+    printf '%s\n' "$line" >> "$KEEPER_LOG" 2>/dev/null
+}
+
+keeper_notify() {
+    local state="$KEEPER_LOG.state" count=0 notified=0
+    [[ -n $KEEPER_NOTIFY_CMD ]] || return 0
+    if [[ -r $state ]]; then read -r count notified < "$state" || true; fi
+    case $count:$notified in *[!0-9:]*|:*) count=0; notified=0 ;; esac
+    if [[ $1 == fail ]]; then
+        count=$((count + 1))
+        if [[ $count -ge $KEEPER_NOTIFY_AFTER && $notified -eq 0 ]]; then
+            "$KEEPER_NOTIFY_CMD" "termux-adb: cannot reach $SERIAL for $count consecutive passes" || true
+            notified=1
+        fi
+    else
+        if [[ $notified -eq 1 ]]; then "$KEEPER_NOTIFY_CMD" "termux-adb: $SERIAL recovered" || true; fi
+        count=0; notified=0
+    fi
+    mkdir -p "$(dirname -- "$state")"
+    printf '%s %s\n' "$count" "$notified" > "$state"
+}
+
+keeper_pass() {
+    local name host watch started=0
+    "$ADB_BIN" connect "$SERIAL" >/dev/null 2>&1 || true
+    if ! device_reachable; then
+        keeper_log "no adb at $SERIAL; the device-side watch or a reboot owns recovery"
+        keeper_notify fail
+        return 0
+    fi
+
+    keeper_notify healthy
+    for name in $(disabled_packages | grep -x 'com\.termux\(\.boot\)\?' || true); do
+        if shell_ok pm enable "$name"; then
+            keeper_log "re-enabled $name"
+        else
+            keeper_log "could not re-enable $name"
+        fi
+    done
+
+    watch=$(watch_pid)
+    if [[ -n $KEEPER_SSH_PORT ]]; then
+        host=$(target_host)
+        [[ -n $host ]] || host=$SERIAL
+        port_open "$host" "$KEEPER_SSH_PORT"
+        if [[ $? -eq 1 ]]; then
+            start_boot_script
+            started=1
+            sleep 5
+            if port_open "$host" "$KEEPER_SSH_PORT"; then
+                keeper_log "sshd was down; the boot script brought it back"
+            else
+                keeper_log "sshd still down after starting the boot script"
+            fi
+        fi
+    fi
+    if [[ -z $watch ]]; then
+        if [[ $started -eq 0 ]]; then
+            start_boot_script
+            sleep 5
+        fi
+        if [[ -n $(watch_pid) ]]; then
+            keeper_log "watch was absent; boot script started"
+        else
+            keeper_log "watch is still absent after starting the boot script"
+        fi
+    elif [[ $started -eq 0 ]]; then
+        : # healthy: stay silent so the log only records repairs
+    fi
+    return 0
+}
+
+# One scheduled keeper per device: the label carries the device so a host can
+# watch a tablet and a phone side by side.
+keeper_label() {
+    if [[ -n $EXPLICIT_SERIAL ]]; then
+        LABEL="com.termux-adb.keeper.$(printf '%s' "$EXPLICIT_SERIAL" | tr -c 'A-Za-z0-9' '-')"
+    fi
+}
+
+keeper_plist_path() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$LABEL"; }
+keeper_unit_path() { printf '%s/.config/systemd/user/%s.service' "$HOME" "$LABEL"; }
+keeper_timer_path() { printf '%s/.config/systemd/user/%s.timer' "$HOME" "$LABEL"; }
+
+keeper_install() {
+    local interval=$1 plist unit timer device_args
+    keeper_label
+    if [[ -n $EXPLICIT_SERIAL ]]; then
+        device_args="--device $EXPLICIT_SERIAL"
+    else
+        device_args=
+    fi
+    case $(uname -s) in
+        Darwin)
+            plist=$(keeper_plist_path)
+            mkdir -p "$(dirname -- "$plist")"
+            {
+                printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+                    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+                    '<plist version="1.0">' '<dict>' \
+                    "  <key>Label</key><string>$LABEL</string>" \
+                    '  <key>ProgramArguments</key>' '  <array>' \
+                    "    <string>$SELF</string>" "    <string>keeper</string>"
+                if [[ -n $device_args ]]; then
+                    printf '    <string>--device</string>\n    <string>%s</string>\n' "$EXPLICIT_SERIAL"
+                fi
+                if [[ -n $KEEPER_SSH_PORT ]]; then
+                    printf '    <string>--ssh-port</string>\n    <string>%s</string>\n' "$KEEPER_SSH_PORT"
+                fi
+                if [[ -n $KEEPER_NOTIFY_CMD ]]; then
+                    printf '    <string>--notify-cmd</string>\n    <string>%s</string>\n    <string>--notify-after</string>\n    <string>%s</string>\n' "$KEEPER_NOTIFY_CMD" "$KEEPER_NOTIFY_AFTER"
+                fi
+                printf '%s\n' \
+                    '    <string>--log</string>' "    <string>$KEEPER_LOG</string>" \
+                    '  </array>' \
+                    '  <key>EnvironmentVariables</key>' '  <dict>' \
+                    "    <key>ADB</key><string>$ADB_BIN</string>" \
+                    "    <key>PATH</key><string>$(dirname -- "$ADB_BIN"):/usr/bin:/bin</string>" \
+                    '  </dict>' \
+                    "  <key>StartInterval</key><integer>$interval</integer>" \
+                    '  <key>RunAtLoad</key><true/>' \
+                    "  <key>StandardOutPath</key><string>$KEEPER_LOG.launchd</string>" \
+                    "  <key>StandardErrorPath</key><string>$KEEPER_LOG.launchd</string>" \
+                    '</dict>' '</plist>'
+            } > "$plist"
+            printf 'wrote %s\n' "$plist"
+            launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+            if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+                printf 'loaded %s (every %ss)\n' "$LABEL" "$interval"
+            else
+                printf 'activate it with: launchctl bootstrap gui/%s %s\n' "$(id -u)" "$plist"
+            fi ;;
+        Linux)
+            unit=$(keeper_unit_path)
+            timer=$(keeper_timer_path)
+            mkdir -p "$(dirname -- "$unit")"
+            cat > "$unit" <<EOF
+[Unit]
+Description=Termux ADB port keeper (one recovery pass)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=ADB=$ADB_BIN
+ExecStart=$SELF keeper $device_args${KEEPER_SSH_PORT:+ --ssh-port $KEEPER_SSH_PORT}${KEEPER_NOTIFY_CMD:+ --notify-cmd "$KEEPER_NOTIFY_CMD" --notify-after $KEEPER_NOTIFY_AFTER} --log $KEEPER_LOG
+EOF
+            cat > "$timer" <<EOF
+[Unit]
+Description=Run the Termux ADB port keeper every ${interval}s
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+            printf 'wrote %s\n' "$unit"
+            printf 'wrote %s\n' "$timer"
+            if systemctl --user daemon-reload >/dev/null 2>&1 \
+                && systemctl --user enable --now "$LABEL.timer" >/dev/null 2>&1; then
+                printf 'enabled %s.timer\n' "$LABEL"
+            else
+                printf 'activate it with: systemctl --user daemon-reload && systemctl --user enable --now %s.timer\n' "$LABEL"
+            fi ;;
+        *)
+            die "keeper --install supports macOS (launchd) and Linux (systemd); for another scheduler run: $SELF keeper $device_args --log $KEEPER_LOG" ;;
+    esac
+    printf 'log: %s\n' "$KEEPER_LOG"
+}
+
+keeper_uninstall() {
+    local plist unit timer path removed=0
+    keeper_label
+    case $(uname -s) in
+        Darwin)
+            plist=$(keeper_plist_path)
+            launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+            if [[ -f $plist ]]; then rm -f "$plist"; printf 'removed %s\n' "$plist"; else printf '%s was not installed\n' "$plist"; fi ;;
+        *)
+            unit=$(keeper_unit_path)
+            timer=$(keeper_timer_path)
+            systemctl --user disable --now "$LABEL.timer" >/dev/null 2>&1 || true
+            for path in "$timer" "$unit"; do
+                if [[ -f $path ]]; then
+                    rm -f "$path"
+                    printf 'removed %s\n' "$path"
+                    removed=1
+                fi
+            done
+            [[ $removed -eq 1 ]] || printf '%s was not installed\n' "$unit" ;;
+    esac
+}
+
+cmd_keeper() {
+    local mode=pass interval=300
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --install) mode=install; shift ;;
+            --uninstall) mode=uninstall; shift ;;
+            -s|--device) [[ $# -ge 2 ]] || usage_error "$1 needs a device"; EXPLICIT_SERIAL=$2; shift 2 ;;
+            --interval) [[ $# -ge 2 ]] || usage_error "--interval needs a number"; interval=$2; shift 2 ;;
+            --ssh-port) [[ $# -ge 2 ]] || usage_error "--ssh-port needs a port"; KEEPER_SSH_PORT=$2; shift 2 ;;
+            --notify-cmd) [[ $# -ge 2 ]] || usage_error "--notify-cmd needs an executable"; KEEPER_NOTIFY_CMD=$2; shift 2 ;;
+            --notify-after) [[ $# -ge 2 ]] || usage_error "--notify-after needs a number"; KEEPER_NOTIFY_AFTER=$2; shift 2 ;;
+            --log) [[ $# -ge 2 ]] || usage_error "--log needs a path"; KEEPER_LOG=$2; shift 2 ;;
+            *) usage_error "unknown keeper option: $1" ;;
+        esac
+    done
+    [[ $KEEPER_NOTIFY_AFTER =~ ^[1-9][0-9]*$ ]] || usage_error "--notify-after must be a positive number"
+    case $mode in
+        install)
+            [[ $interval =~ ^[1-9][0-9]*$ ]] || usage_error "--interval must be a positive number of seconds"
+            require_adb  # the scheduled job gets this absolute adb path
+            keeper_install "$interval" ;;
+        uninstall) keeper_uninstall ;;
+        *)
+            [[ $interval == 300 ]] || usage_error "--interval only applies with --install"
+            require_adb
+            resolve_serial
+            keeper_pass ;;
+    esac
+}
+
+# --- entry point ----------------------------------------------------------------------
+
+CMD=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--device) [[ $# -ge 2 ]] || usage_error "$1 needs a device"; EXPLICIT_SERIAL=$2; shift 2 ;;
+        --version|-V) printf 'termux-adb %s\n' "$VERSION"; exit 0 ;;
+        -h|--help|help) usage; exit 0 ;;
+        install|doctor|keeper) CMD=$1; shift; break ;;
+        -*) usage_error "unknown option: $1" ;;
+        *) usage_error "unknown command: $1" ;;
+    esac
+done
+[[ -n $CMD ]] || { usage; exit 2; }
+
+case $CMD in
+    install)
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --ssh-key) [[ $# -ge 2 ]] || usage_error "--ssh-key needs a file"; INSTALL_SSH_KEY=$2; shift 2 ;;
+                --no-start) INSTALL_START=0; shift ;;
+                --battery-saver) INSTALL_BATTERY_SAVER=1; shift ;;
+                --keep-auth-timeout) INSTALL_KEEP_AUTH_TIMEOUT=1; shift ;;
+                --fetch-apps) INSTALL_FETCH_APPS=1; shift ;;
+                --vpn-app) [[ $# -ge 2 && $2 =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || usage_error "--vpn-app needs an Android package name"; INSTALL_VPN_APP=$2; shift 2 ;;
+                -s|--device) [[ $# -ge 2 ]] || usage_error "$1 needs a device"; EXPLICIT_SERIAL=$2; shift 2 ;;
+                *) usage_error "unknown install option: $1" ;;
+            esac
+        done
+        require_adb; resolve_serial; connect_target; cmd_install ;;
+    doctor)
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                -s|--device) [[ $# -ge 2 ]] || usage_error "$1 needs a device"; EXPLICIT_SERIAL=$2; shift 2 ;;
+                --ssh-port) [[ $# -ge 2 ]] || usage_error "--ssh-port needs a port"; DOCTOR_SSH_PORT=$2; shift 2 ;;
+                --ssh-user) [[ $# -ge 2 ]] || usage_error "--ssh-user needs a user"; DOCTOR_SSH_USER=$2; shift 2 ;;
+                *) usage_error "doctor takes no other options: $1" ;;
+            esac
+        done
+        require_adb; resolve_serial; connect_target; cmd_doctor ;;
+    keeper)
+        cmd_keeper "$@" ;;
+esac

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Fake adb for tests/run.sh. It answers the commands termux-adb sends from the
+# fixture directory in $FAKE_FIXTURES, records every call in $FAKE_ADB_LOG, and
+# pretends a watch appears after the boot script is started.
+set -u
+
+F=${FAKE_FIXTURES:?FAKE_FIXTURES is not set}
+printf '%s\n' "$*" >> "${FAKE_ADB_LOG:?FAKE_ADB_LOG is not set}"
+FIXTURE=$F
+
+if [[ ${1:-} == -s ]]; then
+    shift 2
+fi
+
+fixture() { cat "$FIXTURE/$1" 2>/dev/null; }
+
+case ${1:-} in
+    connect|push|pull)
+        exit 0 ;;
+    devices)
+        fixture devices || printf 'List of devices attached\n' ;;
+    get-state)
+        if [[ -e $FIXTURE/unreachable ]]; then exit 1; fi
+        printf 'device\n' ;;
+    shell)
+        shift
+        text=$*
+        case $text in
+            "getprop ro.product.manufacturer") fixture manufacturer ;;
+            "getprop ro.product.model") fixture model ;;
+            "getprop ro.build.version.release") fixture android ;;
+            "getprop service.adb.tcp.port") fixture tcp_port ;;
+            "settings get global adb_allowed_connection_time") if [[ -f $FIXTURE/auth_timeout ]]; then fixture auth_timeout; else printf "0\n"; fi ;;
+            "settings get global adb_wifi_enabled") fixture wifi_debug ;;
+            "pm list packages -d --user current") fixture disabled ;;
+            "pm list packages --user current") fixture installed ;;
+            "dumpsys deviceidle whitelist") fixture whitelist ;;
+            "dumpsys activity mars") fixture mars ;;
+            "dumpsys package com.termux.boot") fixture pkg_boot ;;
+            "dumpsys package com.termux") fixture pkg_termux ;;
+            "ps -A -o PID,ARGS")
+                if [[ -e $FIXTURE/started ]]; then
+                    printf '4242 bash .termux/boot/boot-restore-adb.sh --watch 60\n4243 sshd\n'
+                else
+                    fixture ps
+                fi ;;
+            "run-as com.termux true") [[ ! -e $FIXTURE/run_as_denied ]]; exit $? ;;
+            "run-as com.termux /data/data/com.termux/files/usr/bin/env TMPDIR=/data/data/com.termux/files/usr/tmp HOME=/data/data/com.termux/files/home /data/data/com.termux/files/usr/bin/adb devices") printf "List of devices attached\n127.0.0.1:5555 device\n" ;;
+            "run-as com.termux sha256sum"*) fixture sha ;;
+            "run-as com.termux tail -n 3"*) fixture bootlog ;;
+            "run-as com.termux cat"*) fixture authorized_keys ;;
+            "run-as com.termux sh -c"*)
+                # The boot script was started: later ps calls show a watch.
+                : > "$FIXTURE/started" ;;
+            "run-as com.termux"*) exit 0 ;;
+            "pm enable"*|"pm grant"*|"cmd deviceidle whitelist"*|"am start"*|"input keyevent"*)
+                exit 0 ;;
+            *) exit 0 ;;
+        esac ;;
+    *) exit 0 ;;
+esac

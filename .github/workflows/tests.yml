@@ -1,0 +1,30 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      # macOS runners ship shellcheck through Homebrew; Ubuntu has it in the image.
+      - name: ShellCheck
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          shellcheck termux-adb boot-restore-adb.sh setup.sh tests/run.sh tests/fake-adb
+      - name: Syntax
+        run: |
+          bash -n termux-adb
+          bash -n boot-restore-adb.sh
+          bash -n setup.sh
+          bash -n tests/run.sh
+      # macOS runs its /bin/bash 3.2, which is the oldest shell the scripts support.
+      - name: Tests
+        run: bash tests/run.sh

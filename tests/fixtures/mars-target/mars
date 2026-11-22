@@ -1,0 +1,5 @@
+ACTIVITY MANAGER MARs (dumpsys activity mars)
+mMARsTargetPackages --- size 2
+-RST 2026/01/01 00:00:00.000-PT     39-ST  1-SC F-DT  0-DR  1-DD F-Uid    10232(-)-curLv 0-maxLv 4-FAS N/   0(-)-BU   0.000000-Pkg com.example.browser
+-RST 2026/01/01 00:00:00.000-PT     39-ST  1-SC F-DT  0-DR  1-DD F-Uid    10315(-)-curLv 0-maxLv 4-FAS N/   0(-)-BU   0.000000-Pkg com.termux.boot
+mMARsRestrictedPackages --- size 0
