@@ -174,7 +174,7 @@ chmod +x "$WORK/bin/notify"
 export NOTIFY_LOG="$dir/notifications"
 touch "$dir/unreachable"
 run_cli "$dir" "$dir/out" --device FAKE123 keeper --log "$dir/keeper.log" --notify-cmd "$WORK/bin/notify" --notify-after 2
-[[ ! -e $NOTIFY_LOG ]] && ok "no early notification" || no "no early notification" "notification arrived early"
+if [[ ! -e $NOTIFY_LOG ]]; then ok "no early notification"; else no "no early notification" "notification arrived early"; fi
 run_cli "$dir" "$dir/out" --device FAKE123 keeper --log "$dir/keeper.log" --notify-cmd "$WORK/bin/notify" --notify-after 2
 expect_line "notifies after two failures" "$NOTIFY_LOG" "2 consecutive passes"
 rm "$dir/unreachable"
@@ -195,7 +195,7 @@ chmod +x "$WORK/setup-bin/curl"
 # Run from stdin to exercise the remote-download path.
 HOME="$WORK/setup-home" PATH="$WORK/setup-bin:$PATH" bash -s -- --battery-saver --ssh-key 'ssh-ed25519 AAAATEST test' < "$ROOT/setup.sh" > "$WORK/setup.out" 2>&1
 expect_status "setup runs in a clean Termux home" 0 $?
-[[ -x $WORK/setup-home/.termux/boot/boot-restore-adb.sh ]] && ok "setup installs boot script" || no "setup installs boot script" "script missing"
+if [[ -x $WORK/setup-home/.termux/boot/boot-restore-adb.sh ]]; then ok "setup installs boot script"; else no "setup installs boot script" "script missing"; fi
 expect_line "setup adds SSH key" "$WORK/setup-home/.ssh/authorized_keys" 'ssh-ed25519 AAAATEST test'
 
 # --- result ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ if [[ ${1:-} == --help ]]; then
 fi
 
 # Optional per-device settings written by `termux-adb install --battery-saver`.
+# shellcheck source=/dev/null
 [[ -f "$HOME/.termux/boot-restore-adb.env" ]] && . "$HOME/.termux/boot-restore-adb.env"
 PORT=${ADB_RESTORE_PORT:-5555}
 WAKE_LOCK=${ADB_RESTORE_WAKE_LOCK:-1}
